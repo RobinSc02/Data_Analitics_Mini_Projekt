@@ -1,0 +1,7 @@
+Phase;Start;End;Description
+Pre-Covid;01.07.2018;13.03.2020;"""Normal competition with full attendance"""
+Stop;14.03.2020;15.05.2020;"""League suspended due to first lockdown"""
+GhostGames_2019_20;16.05.2020;27.06.2020;"""End of 2019/20 season without fans"""
+GhostGames_2020_21;18.09.2020;22.05.2021;"""Entire 2020/21 season without fans (rare exceptions)"""
+PartialFans_2021_22;13.08.2021;14.05.2022;"""2021/22 season with limited or regionally restricted attendance"""
+Post-Covid;01.07.2022;30.06.2025;"""Full stadiums, normal competition"""
