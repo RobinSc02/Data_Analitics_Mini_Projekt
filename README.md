@@ -152,3 +152,10 @@ python main.py
 * **Notebooks:** in `notebooks/` öffnen → Kernal `Python (da-mini)` → ausführen
 * **Pipeline:** im Repo-Root `python main.py`
 
+
+
+<img width="1088" height="489" alt="image" src="https://github.com/user-attachments/assets/a410f090-e422-46a1-9a3c-f076ef47e050" />
+<img width="989" height="490" alt="image" src="https://github.com/user-attachments/assets/4f30442f-efd4-4693-af09-b7cc56baaf59" />
+
+
+
