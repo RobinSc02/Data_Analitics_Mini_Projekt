@@ -140,6 +140,11 @@ git push -u origin feature/mein-thema
 | „Updates were rejected“ beim Push          | Main ist neuer                               | `git pull --rebase origin main` → erneut `git push`                            |
 | Große CSV/ZIP blockieren Push              | LFS fehlt                                    | `git lfs install && git lfs track "*.csv" "*.zip"` → commit `.gitattributes`   |
 
+
+cd C:\Users\admin\IdeaProjects\Data_Analitics_Mini_Projekt
+python main.py
+
+
 ---
 
 ## Start
