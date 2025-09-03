@@ -12,14 +12,9 @@ import pandas as pd
 # =============================================================================
 
 def _init_features_logger(log_dir: str | Path = None) -> logging.Logger:
-    """
-    Logger 'features_metrics' mit FileHandler.
-    Logfile: <projekt>/logs/metrics.log (Default)
-    """
     logger = logging.getLogger("features_metrics")
     if logger.handlers:
-        return logger  # bereits konfiguriert
-
+        return logger
     if log_dir is None:
         log_dir = Path(__file__).resolve().parents[1] / "logs"
     log_dir = Path(log_dir)
@@ -43,18 +38,186 @@ def _init_features_logger(log_dir: str | Path = None) -> logging.Logger:
 
 
 # =============================================================================
-# Loader: Matches (Season + Performance in einem Rutsch)
+# Loader-Helfer
+# =============================================================================
+
+def _to_num(s: pd.Series) -> pd.Series:
+    if s.dtype.kind in "biufc":
+        return pd.to_numeric(s, errors="coerce")
+    return pd.to_numeric(
+        s.astype(str)
+         .str.replace("\u2009", "", regex=False)
+         .str.replace(" ", "", regex=False)
+         .str.replace(",", ".", regex=False)
+         .str.replace(r"[^0-9\.\-]", "", regex=True),
+        errors="coerce"
+    )
+
+def _parse_dates_any(s: pd.Series) -> pd.Series:
+    """Robuste Datumserkennung: ISO ‘YYYY-mm-dd’ bevorzugt, sonst dayfirst=True."""
+    vals = s.astype(str).str.strip()
+    iso_mask = vals.str.match(r"^\d{4}-\d{2}-\d{2}$")
+    if iso_mask.mean() >= 0.8:
+        return pd.to_datetime(vals, errors="coerce", format="%Y-%m-%d")
+    # fallback: häufig EU-Format
+    return pd.to_datetime(vals, errors="coerce", dayfirst=True)
+
+def _normalize_result_from_scores(hg: pd.Series, ag: pd.Series) -> pd.Series:
+    return np.where(hg > ag, "H", np.where(hg < ag, "A", "D"))
+
+def _cols_lower_map(df: pd.DataFrame): return {c.lower(): c for c in df.columns}
+
+# Kandidatenlisten
+HOME_GOAL_COLS = ["fthg","homegoals","home_goals","hg","home_score","home_ftg","hgoals","score_x","goals_home"]
+AWAY_GOAL_COLS = ["ftag","awaygoals","away_goals","ag","away_score","away_ftg","agoals","score_y","goals_away"]
+RESULT_COLS    = ["ftr","result","ft_result","full_time_result","outcome"]
+
+_XG_HOME_COLS  = ["xg_home","home_xg","hxg","xg_h","xgh","xg_x","homexg","xg (h)","xg (home)"]
+_XG_AWAY_COLS  = ["xg_away","away_xg","axg","xg_a","xga","xg_y","awayxg","xg (a)","xg (away)"]
+_XPTS_HOME_COLS= ["xpts_home","home_xpts","xpoints_home","xp_home","xph","xpts (h)","xpts_x","exppts_home","exp_points_home"]
+_XPTS_AWAY_COLS= ["xpts_away","away_xpts","xpoints_away","xp_away","xpa","xpts (a)","xpts_y","exppts_away","exp_points_away"]
+_XP_HOME_COLS  = ["xp_home","home_xp","xpoints_home","exppts_home","exp_points_home","xpoints_h","xp (h)","xp_x"]
+_XP_AWAY_COLS  = ["xp_away","away_xp","xpoints_away","exppts_away","exp_points_away","xpoints_a","xp (a)","xp_y"]
+
+def _regex_find_pairs(df: pd.DataFrame, key="xg"):
+    names = list(df.columns)
+    low   = [n.lower() for n in names]
+    home_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(home|^h[^a-z]?|_h\b|\(h\)|-home|\bhome\b)", n)]
+    away_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(away|^a[^a-z]?|_a\b|\(a\)|-away|\baway\b)", n)]
+    if home_idx and away_idx:
+        return names[home_idx[0]], names[away_idx[0]]
+    x_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(_x\b|\(x\))", n)]
+    y_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(_y\b|\(y\))", n)]
+    if x_idx and y_idx:
+        return names[x_idx[0]], names[y_idx[0]]
+    return None, None
+
+def _pick_col(cols_map, candidates):
+    for c in candidates:
+        c = c.lower()
+        if c in cols_map:
+            return cols_map[c]
+    return None
+
+def _find_metric_pair(df: pd.DataFrame, home_cands: list[str], away_cands: list[str], key: str):
+    cm = _cols_lower_map(df)
+    ch = _pick_col(cm, home_cands)
+    ca = _pick_col(cm, away_cands)
+    if ch and ca:
+        return ch, ca, "candidates"
+    rh, ra = _regex_find_pairs(df, key=key)
+    if rh and ra:
+        return rh, ra, "regex"
+    key_cols = [orig for orig, lo in zip(df.columns, [c.lower() for c in df.columns]) if key in lo]
+    if len(key_cols) == 2:
+        return key_cols[0], key_cols[1], "heuristic(2match)"
+    return None, None, None
+
+
+# =============================================================================
+# Long-Format (eine Zeile pro Team) -> Match-Format
+# =============================================================================
+
+def _is_home_flag(venue: str | float) -> float:
+    if isinstance(venue, str):
+        v = venue.strip().lower()
+        if v in ("h","home","heim"):
+            return 1.0
+        if v in ("a","away","auswärts","away "):
+            return 0.0
+    return np.nan
+
+def _pair_key_from_long(row: pd.Series) -> str:
+    t, o = str(row["Team"]), str(row["Opponent"])
+    d = row["Date"]
+    return (t if t < o else o) + "___" + (o if t < o else t) + "___" + str(d)
+
+def _try_build_from_long_per_team(df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
+    cm = _cols_lower_map(df)
+
+    team = next((cm[k] for k in ["team","mannschaft","squad"] if k in cm), None)
+    opp  = next((cm[k] for k in ["opponent","gegner","opp"] if k in cm), None)
+    date = next((cm[k] for k in ["date","match_date","datum"] if k in cm), None)
+    venue= next((cm[k] for k in ["venue","homeaway","ha","ort"] if k in cm), None)
+
+    xg_for  = next((cm[k] for k in ["xg_for","xg (for)","expectedgoalsfor","xgf","team_xg","xg"] if k in cm), None)
+    xg_against = next((cm[k] for k in ["xg_against","xg (against)","expectedgoalsagainst","xga","opp_xg","xg_allowed"] if k in cm), None)
+
+    gf = next((cm[k] for k in ["goalsfor","gf","goals for","team_goals","goals"] if k in cm), None)
+    ga = next((cm[k] for k in ["goalsagainst","ga","goals against","opp_goals","against"] if k in cm), None)
+    score = next((cm[k] for k in ["score","result","endstand"] if k in cm), None)
+
+    if not (team and opp and date):
+        return pd.DataFrame()
+
+    tmp = pd.DataFrame()
+    tmp["Team"] = df[team].astype(str)
+    tmp["Opponent"] = df[opp].astype(str)
+    tmp["Date"] = _parse_dates_any(df[date])
+    tmp["home_flag_row"] = df[venue].apply(_is_home_flag) if venue else np.nan
+
+    tmp["xg_for"] = _to_num(df[xg_for]) if xg_for else np.nan
+    tmp["xg_against"] = _to_num(df[xg_against]) if xg_against else np.nan
+
+    tmp["gf"] = _to_num(df[gf]) if gf else np.nan
+    tmp["ga"] = _to_num(df[ga]) if ga else np.nan
+
+    if score and tmp["gf"].isna().all() and tmp["ga"].isna().all():
+        sc = df[score].astype(str)
+        m = sc.str.extract(r"(?P<h>\d+)\D+(?P>a>\d+)")
+        tmp["gf"] = _to_num(m["h"])
+        tmp["ga"] = _to_num(m["a"])
+
+    tmp["pair_key"] = tmp.apply(_pair_key_from_long, axis=1)
+
+    rows = []
+    for k, block in tmp.groupby("pair_key"):
+        if len(block) < 2:
+            continue
+        b = block.sort_values(["home_flag_row"], ascending=False)
+        h = b.iloc[0]
+        a = b.iloc[1]
+        out = {
+            "Date": h["Date"],
+            "HomeTeam": h["Team"],
+            "AwayTeam": a["Team"],
+            "FTHG": h["gf"] if not pd.isna(h["gf"]) else a["ga"],
+            "FTAG": a["gf"] if not pd.isna(a["gf"]) else h["ga"],
+        }
+        if pd.notna(out["FTHG"]) and pd.notna(out["FTAG"]):
+            out["FTR"] = _normalize_result_from_scores(pd.Series([out["FTHG"]]), pd.Series([out["FTAG"]]))[0]
+        else:
+            out["FTR"] = np.nan
+
+        out["xg_home"] = h["xg_for"] if not pd.isna(h["xg_for"]) else a["xg_against"]
+        out["xg_away"] = a["xg_for"] if not pd.isna(a["xg_for"]) else h["xg_against"]
+
+        rows.append(out)
+
+    if not rows:
+        return pd.DataFrame()
+
+    res = pd.DataFrame(rows)
+    logger.info("Legacy Long-Format erkannt und gepivotet: %d Matches", len(res))
+    return res
+
+
+# =============================================================================
+# Loader: Matches
 # =============================================================================
 
 def _to_match_schema(df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
     """
-    Bringt verschiedene CSV-Formate auf ein einheitliches Match-Schema:
-    Benötigt am Ende: Date, HomeTeam, AwayTeam, FTHG, FTAG, FTR
-    Erkennt zusätzlich Performance-Format mit Home/Away, Score_x/Score_y, xG_x/xG_y.
+    Vereinheitlicht auf: Date, HomeTeam, AwayTeam, FTHG, FTAG, FTR (+ optional xg_home/xg_away, xpts_*)
+    Unterstützt:
+      1) Klassisches Season-Format (HomeTeam/AwayTeam/FTHG/FTAG/FTR[/Date])
+      2) Performance-Format wide (Home/Away + Score_x/Score_y + xG_x/xG_y)
+      3) Legacy-Format long (Team/Opponent/Venue + xG_for/xG_against + GoalsFor/GoalsAgainst)
+      4) Multi-Section CSVs (Match + Players): wir extrahieren den Match-Block
     """
     cols = {c.lower(): c for c in df.columns}
 
-    # 1) Klassisches Season-Format? (bereits korrekt: HomeTeam/AwayTeam/FTHG/FTAG/FTR)
+    # (1) Klassisches Season-Format
     if all(k in cols for k in ["hometeam", "awayteam", "fthg", "ftag"]) and "ftr" in cols:
         out = df.rename(columns={
             cols["hometeam"]: "HomeTeam",
@@ -63,68 +226,60 @@ def _to_match_schema(df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
             cols["ftag"]: "FTAG",
             cols["ftr"]: "FTR",
         }).copy()
-
-        # Datum vereinheitlichen
-        date_col = cols.get("date")
-        if date_col:
-            out["Date"] = pd.to_datetime(out[date_col], dayfirst=True, errors="coerce")
-        elif "Date" not in out.columns:
-            out["Date"] = pd.NaT
-
+        date_col = cols.get("date") or cols.get("match_date") or cols.get("datum")
+        out["Date"] = _parse_dates_any(out[date_col]) if date_col else pd.NaT
+        # evtl. xG already
+        xg_h = cols.get("xg_home") or cols.get("xg (home)") or cols.get("xg_h")
+        xg_a = cols.get("xg_away") or cols.get("xg (away)") or cols.get("xg_a")
+        if xg_h: out["xg_home"] = _to_num(df[xg_h])
+        if xg_a: out["xg_away"] = _to_num(df[xg_a])
         return out
 
-    # 2) Performance-Format? (Home/Away, Score_x/Score_y, xG_x/xG_y)
+    # (2) Performance-Format wide
     if "home" in cols and "away" in cols:
         out = pd.DataFrame()
         out["HomeTeam"] = df[cols["home"]].astype(str)
         out["AwayTeam"] = df[cols["away"]].astype(str)
 
-        # Score -> FTHG/FTAG
-        fthg = cols.get("score_x") or cols.get("home_score") or cols.get("fthg")
-        ftag = cols.get("score_y") or cols.get("away_score") or cols.get("ftag")
+        fthg = cols.get("score_x") or cols.get("home_score") or cols.get("fthg") or cols.get("home_goals")
+        ftag = cols.get("score_y") or cols.get("away_score") or cols.get("ftag") or cols.get("away_goals")
         if fthg and ftag:
-            out["FTHG"] = pd.to_numeric(df[fthg], errors="coerce")
-            out["FTAG"] = pd.to_numeric(df[ftag], errors="coerce")
-            out["FTR"] = np.where(out["FTHG"] > out["FTAG"], "H",
-                           np.where(out["FTHG"] < out["FTAG"], "A", "D"))
+            out["FTHG"] = _to_num(df[fthg])
+            out["FTAG"] = _to_num(df[ftag])
+            out["FTR"] = _normalize_result_from_scores(out["FTHG"], out["FTAG"])
         else:
-            # Falls Score fehlt, können wir kein FTR bauen -> unbrauchbar für das Match-Schema
             logger.warning("Performance-CSV ohne Score-Spalten; Datei wird übersprungen.")
             return pd.DataFrame()
 
-        # xG
-        xg_h = cols.get("xg_x") or cols.get("xg_home")
-        xg_a = cols.get("xg_y") or cols.get("xg_away")
+        xg_h = cols.get("xg_x") or cols.get("xg_home") or cols.get("xg (home)") or cols.get("xg_h")
+        xg_a = cols.get("xg_y") or cols.get("xg_away") or cols.get("xg (away)") or cols.get("xg_a")
         if xg_h is not None:
-            out["xg_home"] = pd.to_numeric(df[xg_h], errors="coerce")
+            out["xg_home"] = _to_num(df[xg_h])
         if xg_a is not None:
-            out["xg_away"] = pd.to_numeric(df[xg_a], errors="coerce")
+            out["xg_away"] = _to_num(df[xg_a])
 
-        # xPTS / xP (falls vorhanden)
-        xpts_h = cols.get("xpts_home") or cols.get("xp_home")
-        xpts_a = cols.get("xpts_away") or cols.get("xp_away")
+        xpts_h = cols.get("xpts_home") or cols.get("xp_home") or cols.get("exp_points_home")
+        xpts_a = cols.get("xpts_away") or cols.get("xp_away") or cols.get("exp_points_away")
         if xpts_h is not None:
-            out["xpts_home"] = pd.to_numeric(df[xpts_h], errors="coerce")
+            out["xpts_home"] = _to_num(df[xpts_h])
         if xpts_a is not None:
-            out["xpts_away"] = pd.to_numeric(df[xpts_a], errors="coerce")
+            out["xpts_away"] = _to_num(df[xpts_a])
 
-        # Datum
-        date_col = cols.get("date")
-        out["Date"] = pd.to_datetime(df[date_col], errors="coerce") if date_col else pd.NaT
+        date_col = cols.get("date") or cols.get("match_date") or cols.get("datum")
+        out["Date"] = _parse_dates_any(df[date_col]) if date_col else pd.NaT
         return out
 
-    # 3) Nicht erkennbar -> leer zurück (wird später ignoriert)
-    logger.info("CSV-Format nicht als Match- oder Performance-Match erkannt. Spalten: %s", list(df.columns)[:12])
+    # (3) Legacy Long-Format
+    legacy = _try_build_from_long_per_team(df, logger)
+    if not legacy.empty:
+        return legacy
+
+    # Kein Treffer
+    logger.info("CSV-Format nicht als Match erkannt. Erste Spalten: %s", list(df.columns)[:12])
     return pd.DataFrame()
 
 
 def load_matches(files: list[str]) -> pd.DataFrame:
-    """
-    Lädt *alle* übergebenen CSVs und versucht, sie auf ein einheitliches Match-DF zu mappen.
-    Unterstützt:
-      - Klassische Season-Dateien (HomeTeam/AwayTeam/FTHG/FTAG/FTR/Date)
-      - Performance-Dateien mit (Home, Away, Score_x, Score_y, xG_x, xG_y, Date)
-    """
     logger = _init_features_logger()
     if not files:
         return pd.DataFrame()
@@ -137,13 +292,14 @@ def load_matches(files: list[str]) -> pd.DataFrame:
             logger.warning("CSV konnte nicht gelesen werden: %s (%s)", f, e)
             continue
 
-        # Spieler-Aggregate erkennen und überspringen
+        mapped = _to_match_schema(raw, logger)
+
         lower_cols = [c.lower() for c in raw.columns]
-        if "player_name" in lower_cols or "player" in lower_cols:
-            logger.info("Überspringe Player-CSV (keine Match-Keys vorhanden): %s", f)
+        is_player_table = ("player_name" in lower_cols) or ("player" in lower_cols)
+        if mapped.empty and is_player_table:
+            logger.info("Überspringe Player-CSV ohne Match-Block: %s", f)
             continue
 
-        mapped = _to_match_schema(raw, logger)
         if not mapped.empty:
             mapped["__source_file"] = Path(f).name
             frames.append(mapped)
@@ -155,10 +311,9 @@ def load_matches(files: list[str]) -> pd.DataFrame:
 
     df = pd.concat(frames, ignore_index=True)
 
-    # Standardisieren & filtern (ein Rutsch, vermeidet Fragmentation-Warnings)
     if "Date" not in df.columns:
         df["Date"] = pd.NaT
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
 
     required = ["HomeTeam", "AwayTeam", "FTR", "FTHG", "FTAG"]
     df = (df.sort_values("Date")
@@ -170,6 +325,8 @@ def load_matches(files: list[str]) -> pd.DataFrame:
         AwayPoints = df["FTR"].map({"H": 0, "D": 1, "A": 3}),
         GD         = pd.to_numeric(df["FTHG"], errors="coerce") - pd.to_numeric(df["FTAG"], errors="coerce"),
     )
+
+    df = ensure_xpts_from_xg(df)  # ergänzt xPTS nur bei vorhandenen xG
     return df
 
 
@@ -185,14 +342,12 @@ def implied_probs_row(row, h, d, a):
     return pd.Series({"b365_H": ph/s, "b365_D": pdraw/s, "b365_A": pa/s})
 
 def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
-    # Implied probs (einfach normalisiert)
     if set(["B365H","B365D","B365A"]).issubset(df.columns):
         mask = df[["B365H","B365D","B365A"]].notna().all(axis=1)
         df.loc[mask, ["b365_H","b365_D","b365_A"]] = df.loc[mask].apply(
             implied_probs_row, axis=1, args=("B365H","B365D","B365A")
         )
 
-    # Form (rolling 5, ohne Leakage via shift)
     df["home_form5_pts"] = (
         df.groupby("HomeTeam")["HomePoints"]
           .transform(lambda s: s.shift(1).rolling(5, min_periods=1).mean())
@@ -204,7 +359,6 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
 
     df["form5_pts_diff"] = df["home_form5_pts"] - df["away_form5_pts"]
 
-    # Pair-ID für H2H
     pid = np.where(
         df["HomeTeam"] < df["AwayTeam"],
         df["HomeTeam"] + "___" + df["AwayTeam"],
@@ -213,7 +367,6 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
     df["pair_id"] = pid
     df = df.reset_index(drop=True)
 
-    # H2H-Punkte aus Sicht des aktuellen Heimteams (letzte 3)
     h2h = []
     for i, r in df.iterrows():
         g = df[(df["pair_id"] == r["pair_id"]) & (df.index < i)].tail(3)
@@ -244,9 +397,6 @@ def build_Xy(df: pd.DataFrame):
 # =============================================================================
 
 def add_elo_and_rest_features(df: pd.DataFrame, K=20.0, HFA=60.0) -> pd.DataFrame:
-    """
-    Fügt PRE-Match Elo (ohne Leakage) + Resttage hinzu.
-    """
     df = df.sort_values("Date").reset_index(drop=True)
 
     ratings: dict[str, float] = {}
@@ -288,10 +438,6 @@ def add_elo_and_rest_features(df: pd.DataFrame, K=20.0, HFA=60.0) -> pd.DataFram
 
 def make_features_for_fixture(df_hist: pd.DataFrame, home: str, away: str, when, oddsH, oddsD, oddsA,
                               K=20.0, HFA=60.0) -> pd.DataFrame:
-    """
-    Baut Features für ein kommendes Spiel NUR aus Historie < when (keine Leakage).
-    Rechnet Elo/Resttage on-the-fly.
-    """
     when = pd.to_datetime(when)
     hist = df_hist[df_hist["Date"] < when].sort_values("Date")
 
@@ -347,10 +493,6 @@ def make_features_for_fixture(df_hist: pd.DataFrame, home: str, away: str, when,
 # =============================================================================
 # Kennzahlen: Heimsieg-Quoten
 # =============================================================================
-
-HOME_GOAL_COLS = ["fthg","homegoals","home_goals","hg","home_score","home_ftg","hgoals"]
-AWAY_GOAL_COLS = ["ftag","awaygoals","away_goals","ag","away_score","away_ftg","agoals"]
-RESULT_COLS    = ["ftr","result","ft_result","full_time_result","outcome"]
 
 def _lower_map(columns): return {c.lower(): c for c in columns}
 
@@ -456,54 +598,8 @@ def home_win_stats(df: pd.DataFrame, logger: logging.Logger | None = None) -> di
 
 
 # =============================================================================
-# Performance (xG/xPTS/xP): Erkennung + Statistik (für bereits gemapptes DF)
+# Performance-Stats (xG/xPTS/xP)
 # =============================================================================
-
-_XG_HOME_COLS  = ["xg_home","home_xg","hxg","xg_h","xgh","xg_x","homexg","xg (h)","xg (home)"]
-_XG_AWAY_COLS  = ["xg_away","away_xg","axg","xg_a","xga","xg_y","awayxg","xg (a)","xg (away)"]
-_XPTS_HOME_COLS= ["xpts_home","home_xpts","xpoints_home","xp_home","xph","xpts (h)","xpts_x","exppts_home","exp_points_home"]
-_XPTS_AWAY_COLS= ["xpts_away","away_xpts","xpoints_away","xp_away","xpa","xpts (a)","xpts_y","exppts_away","exp_points_away"]
-_XP_HOME_COLS  = ["xp_home","home_xp","xpoints_home","exppts_home","exp_points_home","xpoints_h","xp (h)","xp_x"]
-_XP_AWAY_COLS  = ["xp_away","away_xp","xpoints_away","exppts_away","exp_points_away","xpoints_a","xp (a)","xp_y"]
-
-def _cols_lower_map(df: pd.DataFrame): return {c.lower(): c for c in df.columns}
-
-def _pick_col(cols_map, candidates):
-    for c in candidates:
-        c = c.lower()
-        if c in cols_map:
-            return cols_map[c]
-    return None
-
-def _regex_find_pairs(df: pd.DataFrame, key="xg"):
-    names = list(df.columns)
-    low   = [n.lower() for n in names]
-    home_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(home|^h[^a-z]?|_h\b|\(h\)|-home|\bhome\b)", n)]
-    away_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(away|^a[^a-z]?|_a\b|\(a\)|-away|\baway\b)", n)]
-    if home_idx and away_idx:
-        return names[home_idx[0]], names[away_idx[0]]
-    x_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(_x\b|\(x\))", n)]
-    y_idx = [i for i, n in enumerate(low) if re.search(rf"\b{key}\b", n) and re.search(r"(_y\b|\(y\))", n)]
-    if x_idx and y_idx:
-        return names[x_idx[0]], names[y_idx[0]]
-    return None, None
-
-def _find_metric_pair(df: pd.DataFrame, home_cands: list[str], away_cands: list[str], key: str):
-    cm = _cols_lower_map(df)
-    ch = _pick_col(cm, home_cands)
-    ca = _pick_col(cm, away_cands)
-    if ch and ca:
-        return ch, ca, "candidates"
-
-    rh, ra = _regex_find_pairs(df, key=key)
-    if rh and ra:
-        return rh, ra, "regex"
-
-    key_cols = [orig for orig, lo in zip(df.columns, [c.lower() for c in df.columns]) if key in lo]
-    if len(key_cols) == 2:
-        return key_cols[0], key_cols[1], "heuristic(2match)"
-
-    return None, None, None
 
 def _ttest_paired(x, y):
     try:
@@ -522,9 +618,6 @@ def _wilcoxon_signed(x, y):
         return float("nan"), float("nan")
 
 def performance_home_away_stats(df: pd.DataFrame, logger: logging.Logger | None = None) -> dict:
-    """
-    Vergleicht Leistung zuhause vs. auswärts anhand von xG und xPTS/xP (falls vorhanden).
-    """
     logger = logger or _init_features_logger()
     out: dict[str, dict] = {}
 
@@ -573,3 +666,80 @@ def performance_home_away_stats(df: pd.DataFrame, logger: logging.Logger | None 
         out[k]["decision"] = _decision(k)
 
     return out
+
+
+# =============================================================================
+# xPTS aus xG – robust
+# =============================================================================
+
+def ensure_xpts_from_xg(
+    df: pd.DataFrame,
+    logger: logging.Logger | None = None,
+    win_points: float = 3.0,
+    draw_points: float = 1.0,
+    tie_eps: float = 1e-6,
+    create_delta_col: bool = True,
+    force_recompute: bool = False,
+) -> pd.DataFrame:
+    logger = logger or _init_features_logger()
+
+    ch, ca, how = _find_metric_pair(df, _XG_HOME_COLS, _XG_AWAY_COLS, key="xg")
+    if not ch or not ca:
+        logger.warning("ensure_xpts_from_xg: Keine xG-Home/Away-Spalten erkannt – keine xPTS-Ableitung möglich.")
+        return df
+
+    xg_h = pd.to_numeric(df[ch], errors="coerce")
+    xg_a = pd.to_numeric(df[ca], errors="coerce")
+    mask_valid = xg_h.notna() & xg_a.notna()
+    if not mask_valid.any():
+        logger.info("ensure_xpts_from_xg: Keine Zeilen mit validen xG gefunden – keine xPTS ergänzt.")
+        if create_delta_col and {"xpts_home", "xpts_away"}.issubset(df.columns):
+            df["xpts_delta_home_minus_away"] = pd.to_numeric(df["xpts_home"], errors="coerce") - pd.to_numeric(df["xpts_away"], errors="coerce")
+        return df
+
+    if "xpts_home" not in df.columns or force_recompute:
+        df["xpts_home"] = np.nan
+    if "xpts_away" not in df.columns or force_recompute:
+        df["xpts_away"] = np.nan
+
+    mask_fill_h = mask_valid & (force_recompute | df["xpts_home"].isna())
+    mask_fill_a = mask_valid & (force_recompute | df["xpts_away"].isna())
+    mask_fill   = mask_fill_h | mask_fill_a
+    if not mask_fill.any():
+        if create_delta_col:
+            df["xpts_delta_home_minus_away"] = pd.to_numeric(df["xpts_home"], errors="coerce") - pd.to_numeric(df["xpts_away"], errors="coerce")
+        return df
+
+    diff = xg_h - xg_a
+    h_win = diff >  tie_eps
+    a_win = diff < -tie_eps
+    draw  = ~(h_win | a_win)
+
+    home_new = pd.Series(np.nan, index=df.index, dtype="float64")
+    away_new = pd.Series(np.nan, index=df.index, dtype="float64")
+
+    home_new[mask_fill & h_win] = win_points
+    home_new[mask_fill & a_win] = 0.0
+    home_new[mask_fill & draw]  = draw_points
+
+    away_new[mask_fill & a_win] = win_points
+    away_new[mask_fill & h_win] = 0.0
+    away_new[mask_fill & draw]  = draw_points
+
+    if mask_fill_h.any():
+        df.loc[mask_fill_h, "xpts_home"] = home_new[mask_fill_h]
+    if mask_fill_a.any():
+        df.loc[mask_fill_a, "xpts_away"] = away_new[mask_fill_a]
+
+    if create_delta_col:
+        xh = pd.to_numeric(df["xpts_home"], errors="coerce")
+        xa = pd.to_numeric(df["xpts_away"], errors="coerce")
+        have_both = xh.notna() & xa.notna()
+        delta = pd.Series(np.nan, index=df.index, dtype="float64")
+        delta[have_both] = (xh - xa)[have_both]
+        df["xpts_delta_home_minus_away"] = delta
+
+    n_done = int(mask_fill_h.sum() + mask_fill_a.sum())
+    logger.info("ensure_xpts_from_xg: xPTS ergänzt/gesetzt für %d Werte. Delta-Spalte=%s",
+                n_done, "ja" if create_delta_col else "nein")
+    return df
