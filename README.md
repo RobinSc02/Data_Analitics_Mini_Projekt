@@ -1,3 +1,11 @@
+# Data Analytics Miniprojekt – Heimvorteil im Fußball
+
+Dieses Projekt untersucht den Heimvorteil im professionellen Fußball anhand von Spieldaten der europäischen Top-5-Ligen.  
+Ziel ist die **Quantifizierung des Heimvorteils** sowie die **Analyse zentraler Einflussfaktoren** wie Zuschauerpräsenz, Teamstärke, Reisedistanz und Spielcharakter.  
+
+Neben deskriptiven Analysen wurden Hypothesentests durchgeführt und ein **Vorhersagemodell** (multinomiale logistische Regression) entwickelt, das auf Wettquoten und Kontextfaktoren basiert.   
+
+
 # Setup & Quickstart
 
 > **Ziel:** Repo lokal mit **Anaconda + VS Code** lauffähig machen.
